@@ -1,59 +1,148 @@
 ﻿using System;
 using System.IO.Ports;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
-using System.Xml;
-using System.Globalization;
-using System.Text.RegularExpressions;
 using WinFormsTimer = System.Windows.Forms.Timer;
-
-
-
 
 namespace LEDdriverControlApp
 {
     public partial class Form1 : Form
     {
-        SerialPort serialPort1 = new SerialPort();
-        bool ledState = false; // false = OFF, true = ON
+        private readonly SerialPort serialPort1 = new SerialPort();
         private readonly WinFormsTimer pollTimer = new WinFormsTimer();
 
+        private bool ledState = false;
 
         public Form1()
         {
             InitializeComponent();
-        }
 
-        // Fix for CS1513 and CS8622: 
-        // 1. Move PollTimer_Tick method outside of Form1_Load to correct the misplaced method definition (fixes CS1513).
-        // 2. Add nullable annotations to match EventHandler delegate (fixes CS8622).
+            // Attach BEFORE SerialPort.Open() so no incoming line is missed
+            // once the port is enumerated/opened.
+            serialPort1.DataReceived += SerialPort1_DataReceived;
+        }
 
         private void Form1_Load(object sender, EventArgs e)
         {
+            TryEnableDarkTitleBar(Handle);
+
             RefreshPorts();
+            UpdateConnectionUi(false);
+
             pollTimer.Interval = 250;
             pollTimer.Tick += PollTimer_Tick;
-            // Set UI state based on checkbox at startup
-            checkBox1_CheckedChanged(chkPotMode, EventArgs.Empty);
-            chkPotMode2_CheckedChanged(chkPotMode2, EventArgs.Empty);
 
+            // UI-only initialization. Never call CheckedChanged handlers here,
+            // because startup defaults must not be written to the board.
+            UpdateModeUi(channel2: false);
+            UpdateModeUi(channel2: true);
+        }
 
-            // handler
-        } // <-- This closes Form1_Load properly
+        [DllImport("dwmapi.dll", PreserveSig = true)]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
 
-        // handler
+        // Best-effort: asks the OS to draw this window's title bar in dark
+        // mode too, so the native chrome matches the dark client area
+        // instead of showing a light bar above a dark app. Cosmetic only --
+        // silently does nothing on Windows versions that don't support it.
+        private static void TryEnableDarkTitleBar(IntPtr handle)
+        {
+            try
+            {
+                int useDark = 1;
+                // 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 20H1+ / Win11).
+                // 19 was the same attribute on earlier Win10 dark-mode builds.
+                if (DwmSetWindowAttribute(handle, 20, ref useDark, sizeof(int)) != 0)
+                    DwmSetWindowAttribute(handle, 19, ref useDark, sizeof(int));
+            }
+            catch
+            {
+                // Unsupported OS / API unavailable -- not fatal.
+            }
+        }
+
         private void PollTimer_Tick(object? sender, EventArgs e)
         {
-            if (!serialPort1.IsOpen) return;
-            try { serialPort1.WriteLine("GET:MEAS"); } catch { }
+            if (!serialPort1.IsOpen)
+                return;
+
+            try
+            {
+                serialPort1.WriteLine("GET:MEAS");
+            }
+            catch
+            {
+                // The write failed -- most likely the cable/USB device was
+                // removed. Reset to a clean disconnected state so the user
+                // can reconnect instead of the app silently going dead.
+                HandleUnexpectedDisconnect();
+            }
         }
 
         private void RefreshPorts()
         {
-            cmbPorts.Items.Clear();
-            cmbPorts.Items.AddRange(SerialPort.GetPortNames());
+            string? previousSelection = cmbPorts.SelectedItem?.ToString();
+            string[] ports = SerialPort.GetPortNames();
+
+            cmbPorts.BeginUpdate();
+            try
+            {
+                cmbPorts.Items.Clear();
+                cmbPorts.Items.AddRange(ports);
+
+                if (!string.IsNullOrWhiteSpace(previousSelection) && cmbPorts.Items.Contains(previousSelection))
+                    cmbPorts.SelectedItem = previousSelection;
+                else if (cmbPorts.Items.Count > 0)
+                    cmbPorts.SelectedIndex = 0;
+            }
+            finally
+            {
+                cmbPorts.EndUpdate();
+            }
+        }
+
+        private void btnRefreshPorts_Click(object sender, EventArgs e)
+        {
+            RefreshPorts();
+        }
+
+        private void UpdateConnectionUi(bool connected)
+        {
+            if (connected)
+            {
+                lblConnectionStatus.Text = $"{serialPort1.PortName}  •  Connected";
+                lblConnectionStatus.ForeColor = BrandSuccess;
+                pnlStatusDot.BackColor = BrandSuccess;
+                btnConnect.Text = "Disconnect";
+                cmbPorts.Enabled = false;
+                btnRefreshPorts.Enabled = false;
+                btnLedToggle.Enabled = true;
+            }
+            else
+            {
+                lblConnectionStatus.Text = "Disconnected";
+                lblConnectionStatus.ForeColor = BrandTextSecondary;
+                pnlStatusDot.BackColor = BrandTextMuted;
+                btnConnect.Text = "Connect";
+                cmbPorts.Enabled = true;
+                btnRefreshPorts.Enabled = true;
+                btnLedToggle.Enabled = false;
+                ledState = false;
+            }
         }
 
         private void btnConnect_Click(object sender, EventArgs e)
+        {
+            if (serialPort1.IsOpen)
+            {
+                DisconnectDevice();
+                return;
+            }
+
+            ConnectDevice();
+        }
+
+        private void ConnectDevice()
         {
             if (cmbPorts.SelectedItem == null)
             {
@@ -63,27 +152,92 @@ namespace LEDdriverControlApp
 
             try
             {
-                serialPort1.PortName = cmbPorts.SelectedItem.ToString();
+                serialPort1.PortName = cmbPorts.SelectedItem.ToString()!;
                 serialPort1.BaudRate = 115200;
                 serialPort1.DataBits = 8;
                 serialPort1.Parity = Parity.None;
                 serialPort1.StopBits = StopBits.One;
                 serialPort1.NewLine = "\r\n";
+                serialPort1.ReadTimeout = 1000;
+                serialPort1.WriteTimeout = 1000;
 
                 serialPort1.Open();
+                pollTimer.Start();
 
+                UpdateConnectionUi(true);
 
-                serialPort1.DataReceived += SerialPort1_DataReceived;
+                // The PCB is the source of truth for the configured current
+                // limits; STATE already carries IMAX1/IMAX2, so ask for it
+                // once on connect instead of guessing/defaulting in the UI.
+                try { serialPort1.WriteLine("GET:STATE"); } catch { }
 
-                // start polling the MCU for Vout/Imon
-                pollTimer.Start();   // <-- ADD THIS
-
-
-                MessageBox.Show("Connected to " + serialPort1.PortName);
+                // Fire-and-forget: gives immediate physical confirmation
+                // that communication is working without blocking Connect.
+                _ = BlinkConnectionIndicatorAsync();
             }
             catch (Exception ex)
             {
+                pollTimer.Stop();
+                UpdateConnectionUi(false);
                 MessageBox.Show("Error: " + ex.Message);
+            }
+        }
+
+        private void DisconnectDevice()
+        {
+            pollTimer.Stop();
+
+            try
+            {
+                if (serialPort1.IsOpen)
+                    serialPort1.Close();
+            }
+            catch
+            {
+                // Already gone (e.g. USB was pulled) -- nothing more to do.
+            }
+
+            UpdateConnectionUi(false);
+        }
+
+        // Called when a write to a port we believed was open fails -- the
+        // most common real-world cause is the USB cable being unplugged.
+        // Brings the UI back to a clean disconnected state so the user can
+        // simply plug back in and press Connect again, instead of the app
+        // silently going dead.
+        private void HandleUnexpectedDisconnect()
+        {
+            if (!serialPort1.IsOpen)
+                return;
+
+            DisconnectDevice();
+        }
+
+        // Two short ON/OFF flashes right after a successful connection, so
+        // the user gets immediate physical confirmation that the software
+        // actually talked to the driver. Uses Task.Delay (not Thread.Sleep)
+        // so the UI thread keeps pumping messages between flashes. This is
+        // independent of the LED Toggle button, which must never change
+        // its own label -- ledState is intentionally left untouched here.
+        private async Task BlinkConnectionIndicatorAsync()
+        {
+            for (int i = 0; i < 2; i++)
+            {
+                if (!serialPort1.IsOpen)
+                    return;
+
+                try { serialPort1.WriteLine("ON"); }
+                catch { return; }
+
+                await Task.Delay(200);
+
+                if (!serialPort1.IsOpen)
+                    return;
+
+                try { serialPort1.WriteLine("OFF"); }
+                catch { return; }
+
+                await Task.Delay(200);
             }
         }
 
@@ -95,53 +249,68 @@ namespace LEDdriverControlApp
                 return;
             }
 
-            if (ledState == false)
+            try
             {
-                serialPort1.WriteLine("ON");
-                btnLedToggle.Text = "Turn LED OFF";
-                ledState = true;
+                if (!ledState)
+                {
+                    serialPort1.WriteLine("ON");
+                    ledState = true;
+                }
+                else
+                {
+                    serialPort1.WriteLine("OFF");
+                    ledState = false;
+                }
             }
-            else
-            {
-                serialPort1.WriteLine("OFF");
-                btnLedToggle.Text = "Turn LED ON";
-                ledState = false;
-            }
+            catch { }
         }
 
         private void trackBarDAC_Scroll(object sender, EventArgs e)
         {
             int percent = trackBarDAC.Value;
-            lblDACValue.Text = percent.ToString() + " %";
+            lblDACValue.Text = percent + "%";
 
-            // If POT mode is active, PC must NOT control DAC
-            if (chkPotMode.Checked) return;
+            // Physical potentiometer controls the LED in POT mode.
+            if (chkPotMode.Checked)
+                return;
 
+            // PC controls LED Bar 1 in PC mode.
             if (serialPort1.IsOpen)
             {
-                serialPort1.WriteLine("DAC1:" + percent.ToString());
+                try { serialPort1.WriteLine("DAC1:" + percent); } catch { }
             }
         }
 
-        private void lblIout_Click(object sender, EventArgs e)
+        private void trackBarDAC2_Scroll(object sender, EventArgs e)
         {
+            int percent = trackBarDAC2.Value;
+            lblDACValue2.Text = percent + "%";
 
-        }
+            // Physical potentiometer controls the LED in POT mode.
+            if (chkPotMode2.Checked)
+                return;
 
-        private void lblDACValue_TextChanged(object sender, EventArgs e)
-        {
-
+            // PC controls LED Bar 2 in PC mode.
+            if (serialPort1.IsOpen)
+            {
+                try { serialPort1.WriteLine("DAC2:" + percent); } catch { }
+            }
         }
 
         private void SerialPort1_DataReceived(object sender, SerialDataReceivedEventArgs e)
         {
             try
             {
-                string data = serialPort1.ReadLine();
+                string data = serialPort1.ReadLine().Trim();
 
-                this.Invoke((MethodInvoker)delegate
+                BeginInvoke((MethodInvoker)delegate
                 {
-                    // New combined reply: MEAS:IOUT=123mA,VOUT=12345mV
+                    if (data.StartsWith("STATE:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        ApplyImaxFromState(data);
+                        return;
+                    }
+
                     if (data.StartsWith("MEAS:", StringComparison.OrdinalIgnoreCase))
                     {
                         int ch1Start = data.IndexOf("CH1:", StringComparison.OrdinalIgnoreCase);
@@ -164,52 +333,95 @@ namespace LEDdriverControlApp
                             handled = true;
                         }
 
-                        if (handled) return;
+                        if (handled)
+                            return;
                     }
 
-                    // (Optional) old formats support
+                    // Compatibility with old one-channel replies.
                     if (data.StartsWith("IOUT:", StringComparison.OrdinalIgnoreCase))
-                        lblIout.Text = data.Trim();
-                    if (data.StartsWith("VOUT:", StringComparison.OrdinalIgnoreCase))
-                        lblVout.Text = data.Trim();
+                        lblIout.Text = data.Substring("IOUT:".Length).Trim();
+                    else if (data.StartsWith("VOUT:", StringComparison.OrdinalIgnoreCase))
+                        lblVout.Text = data.Substring("VOUT:".Length).Trim();
                 });
             }
-            catch { }
+            catch
+            {
+                // Serial disconnect/partial line: ignore; no state is written.
+            }
         }
 
-        private void lblIout_Click_1(object sender, EventArgs e)
+        // The firmware's existing STATE response already carries the
+        // currently configured IMAX1/IMAX2 (it's the same response this app
+        // used to require for a full startup handshake). Reusing it here --
+        // once on connect and once after each Apply Limit -- is the only
+        // source of truth for what the PCB actually has configured; the UI
+        // must never fabricate a value. Mode/percentage fields in the same
+        // response are intentionally ignored so this can't reintroduce the
+        // old startup-blocking synchronization behavior.
+        private void ApplyImaxFromState(string data)
         {
+            string? imax1Text = TryExtractBetween(data, "IMAX1=", "mA");
+            string? imax2Text = TryExtractBetween(data, "IMAX2=", "mA");
 
+            if (!string.IsNullOrWhiteSpace(imax1Text) && int.TryParse(imax1Text, out int imax1))
+                txtMaxmA1.Text = imax1.ToString();
+
+            if (!string.IsNullOrWhiteSpace(imax2Text) && int.TryParse(imax2Text, out int imax2))
+                txtMaxmA2.Text = imax2.ToString();
         }
 
-        private void lblVout_Click(object sender, EventArgs e)
+        private void UpdateModeUi(bool channel2)
         {
-
+            if (!channel2)
+            {
+                bool potMode = chkPotMode.Checked;
+                trackBarDAC.Enabled = !potMode;
+                lblDACValue.Enabled = !potMode;
+                SetSegmentActive(btnComputer1, !potMode);
+                SetSegmentActive(btnPot1, potMode);
+                lblControlDesc1.Text = potMode
+                    ? "Controlled by potentiometer connected to POT1"
+                    : "Controlled from this application";
+            }
+            else
+            {
+                bool potMode = chkPotMode2.Checked;
+                trackBarDAC2.Enabled = !potMode;
+                lblDACValue2.Enabled = !potMode;
+                SetSegmentActive(btnComputer2, !potMode);
+                SetSegmentActive(btnPot2, potMode);
+                lblControlDesc2.Text = potMode
+                    ? "Controlled by potentiometer connected to POT2"
+                    : "Controlled from this application";
+            }
         }
 
         private void checkBox1_CheckedChanged(object sender, EventArgs e)
         {
-            bool potMode = chkPotMode.Checked;
+            UpdateModeUi(channel2: false);
 
-            // UI: when POT controls, disable PC slider + textbox
-            trackBarDAC.Enabled = !potMode;
-            lblDACValue.Enabled = !potMode;
-
-            chkPotMode.Text = potMode ? "Control: POT" : "Control: PC";
-
-            // Send mode to MCU (only if connected)
-            if (!serialPort1.IsOpen) return;
+            if (!serialPort1.IsOpen)
+                return;
 
             try
             {
-                serialPort1.WriteLine(potMode ? "MODE1:POT" : "MODE1:PC");
+                serialPort1.WriteLine(chkPotMode.Checked ? "MODE1:POT" : "MODE1:PC");
             }
             catch { }
         }
 
-        private void textBox1_TextChanged(object sender, EventArgs e)
+        private void chkPotMode2_CheckedChanged(object sender, EventArgs e)
         {
+            UpdateModeUi(channel2: true);
 
+            if (!serialPort1.IsOpen)
+                return;
+
+            try
+            {
+                serialPort1.WriteLine(chkPotMode2.Checked ? "MODE2:POT" : "MODE2:PC");
+            }
+            catch { }
         }
 
         private void btnSetMax1_Click(object sender, EventArgs e)
@@ -220,28 +432,24 @@ namespace LEDdriverControlApp
                 return;
             }
 
-            var s = txtMaxmA1.Text.Trim();
-
-            if (!int.TryParse(s, out int imax_mA))
+            if (!int.TryParse(txtMaxmA1.Text.Trim(), out int imax_mA))
             {
                 MessageBox.Show("Please enter a valid integer number (mA).");
                 return;
             }
 
-            if (imax_mA < 0 || imax_mA > 1000)
+            if (imax_mA < 0 || imax_mA > 800)
             {
-                MessageBox.Show("Max current must be between 0 and 1000 mA.");
+                MessageBox.Show("Max current must be between 0 and 800 mA.");
                 return;
             }
 
-            serialPort1.WriteLine($"IMAX1:{imax_mA}");
-        }
-
-
-
-        private void label1_Click(object sender, EventArgs e)
-        {
-
+            try
+            {
+                serialPort1.WriteLine($"IMAX1:{imax_mA}");
+                serialPort1.WriteLine("GET:STATE"); // confirm what the PCB actually stored
+            }
+            catch { }
         }
 
         private void btnSetMax2_Click_1(object sender, EventArgs e)
@@ -252,79 +460,26 @@ namespace LEDdriverControlApp
                 return;
             }
 
-            var s = txtMaxmA2.Text.Trim();
-
-            if (!int.TryParse(s, out int imax_mA))
+            if (!int.TryParse(txtMaxmA2.Text.Trim(), out int imax_mA))
             {
                 MessageBox.Show("Please enter a valid integer number (mA).");
                 return;
             }
 
-            if (imax_mA < 0 || imax_mA > 1000)
+            if (imax_mA < 0 || imax_mA > 800)
             {
-                MessageBox.Show("Max current must be between 0 and 1000 mA.");
+                MessageBox.Show("Max current must be between 0 and 800 mA.");
                 return;
             }
 
-            serialPort1.WriteLine($"IMAX2:{imax_mA}");
-        }
-
-        private void chkPotMode2_CheckedChanged(object sender, EventArgs e)
-        {
-
-            bool potMode = chkPotMode2.Checked;
-
-            trackBarDAC2.Enabled = !potMode;
-            lblDACValue2.Enabled = !potMode;
-
-            chkPotMode2.Text = potMode ? "Control: POT" : "Control: PC";
-
-            if (!serialPort1.IsOpen) return;
-
             try
             {
-                serialPort1.WriteLine(potMode ? "MODE2:POT" : "MODE2:PC");
+                serialPort1.WriteLine($"IMAX2:{imax_mA}");
+                serialPort1.WriteLine("GET:STATE"); // confirm what the PCB actually stored
             }
             catch { }
         }
 
-        private void label2_Click(object sender, EventArgs e)
-        {
-
-        }
-
-        private void label3_Click(object sender, EventArgs e)
-        {
-
-        }
-
-        private void label1_Click_1(object sender, EventArgs e)
-        {
-
-        }
-
-        private void groupBox1_Enter(object sender, EventArgs e)
-        {
-
-        }
-
-        private void trackBarDAC2_Scroll(object sender, EventArgs e)
-        {
-            int percent = trackBarDAC2.Value;
-            lblDACValue2.Text = percent.ToString() + " %";
-
-            if (chkPotMode2.Checked) return;
-
-            if (serialPort1.IsOpen)
-            {
-                serialPort1.WriteLine("DAC2:" + percent.ToString());
-            }
-        }
-
-        private void txtMaxmA2_TextChanged(object sender, EventArgs e)
-        {
-
-        }
         private void UpdateChannelLabels(string segment, bool isChannel2)
         {
             string? ioutText = TryExtractBetween(segment, "IOUT=", "mA");
@@ -333,15 +488,14 @@ namespace LEDdriverControlApp
             if (!string.IsNullOrWhiteSpace(ioutText))
             {
                 if (isChannel2)
-                    lblIout2.Text = $"Iout: {ioutText} mA";
+                    lblIout2.Text = $"{ioutText} mA";
                 else
-                    lblIout.Text = $"Iout: {ioutText} mA";
+                    lblIout.Text = $"{ioutText} mA";
             }
 
             if (!string.IsNullOrWhiteSpace(voutText) && int.TryParse(voutText, out int mvVal))
             {
-                string formatted = $"Vout: {mvVal / 1000.0:0.00} V";
-
+                string formatted = $"{mvVal / 1000.0:0.00} V";
                 if (isChannel2)
                     lblVout2.Text = formatted;
                 else
@@ -350,9 +504,9 @@ namespace LEDdriverControlApp
             else if (!string.IsNullOrWhiteSpace(voutText))
             {
                 if (isChannel2)
-                    lblVout2.Text = "Vout: ---";
+                    lblVout2.Text = "— V";
                 else
-                    lblVout.Text = "Vout: ---";
+                    lblVout.Text = "— V";
             }
         }
 
@@ -367,6 +521,15 @@ namespace LEDdriverControlApp
 
             return text.Substring(start, end - start).Trim();
         }
+
+        private void Form1_FormClosed(object? sender, FormClosedEventArgs e)
+        {
+            pollTimer.Stop();
+            if (serialPort1.IsOpen)
+            {
+                try { serialPort1.Close(); } catch { }
+            }
+            serialPort1.Dispose();
+        }
     }
 }
-
